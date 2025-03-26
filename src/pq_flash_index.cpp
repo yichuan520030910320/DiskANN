@@ -40,8 +40,9 @@ static std::mutex log_file_mutex;
 static std::atomic<int> search_counter(0);
 
 template <typename T, typename LabelT>
-PQFlashIndex<T, LabelT>::PQFlashIndex(std::shared_ptr<AlignedFileReader> &fileReader, diskann::Metric m)
-    : reader(fileReader), metric(m), _thread_data(nullptr)
+PQFlashIndex<T, LabelT>::PQFlashIndex(std::shared_ptr<AlignedFileReader> &fileReader,
+                                      std::shared_ptr<AlignedFileReader> &graphReader, diskann::Metric m)
+    : reader(fileReader), graph_reader(graphReader), metric(m), _thread_data(nullptr)
 {
     diskann::Metric metric_to_invoke = m;
     if (m == diskann::Metric::COSINE || m == diskann::Metric::INNER_PRODUCT)
@@ -154,63 +155,169 @@ void PQFlashIndex<T, LabelT>::setup_thread_data(uint64_t nthreads, uint64_t visi
 template <typename T, typename LabelT>
 std::vector<bool> PQFlashIndex<T, LabelT>::read_nodes(const std::vector<uint32_t> &node_ids,
                                                       std::vector<T *> &coord_buffers,
-                                                      std::vector<std::pair<uint32_t, uint32_t *>> &nbr_buffers)
+                                                      std::vector<std::pair<uint32_t, uint32_t *>> &nbr_buffers,
+                                                      const bool partition_read)
 {
     std::vector<AlignedRead> read_reqs;
     std::vector<bool> retval(node_ids.size(), true);
 
     char *buf = nullptr;
     auto num_sectors = _nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
-    alloc_aligned((void **)&buf, node_ids.size() * num_sectors * defaults::SECTOR_LEN, defaults::SECTOR_LEN);
-
-    // create read requests
-    for (size_t i = 0; i < node_ids.size(); ++i)
-    {
-        auto node_id = node_ids[i];
-
-        AlignedRead read;
-        read.len = num_sectors * defaults::SECTOR_LEN;
-        read.buf = buf + i * num_sectors * defaults::SECTOR_LEN;
-        read.offset = get_node_sector(node_id) * defaults::SECTOR_LEN;
-        read_reqs.push_back(read);
-    }
 
     // borrow thread data and issue reads
     ScratchStoreManager<SSDThreadData<T>> manager(this->_thread_data);
     auto this_thread_data = manager.scratch_space();
     IOContext &ctx = this_thread_data->ctx;
-    reader->read(read_reqs, ctx);
 
-    // copy reads into buffers
-    for (uint32_t i = 0; i < read_reqs.size(); i++)
+#ifdef NDEBUG
+    // -- If not partition_read, this is the normal DiskANN approach:
+    if (not partition_read)
     {
+#endif
+        // (1) read each node's 4 KB from offset = get_node_sector(node_id)*4096
+        alloc_aligned((void **)&buf, node_ids.size() * num_sectors * defaults::SECTOR_LEN, defaults::SECTOR_LEN);
+
+        // create read requests
+        for (size_t i = 0; i < node_ids.size(); ++i)
+        {
+            auto node_id = node_ids[i];
+
+            AlignedRead read;
+            read.len = num_sectors * defaults::SECTOR_LEN;
+            read.buf = buf + i * num_sectors * defaults::SECTOR_LEN;
+            read.offset = get_node_sector(node_id) * defaults::SECTOR_LEN;
+            read_reqs.push_back(read);
+        }
+
+        reader->read(read_reqs, ctx);
+
+        // copy reads into buffers
+        for (uint32_t i = 0; i < read_reqs.size(); i++)
+        {
 #if defined(_WINDOWS) && defined(USE_BING_INFRA) // this block is to handle failed reads in
                                                  // production settings
-        if ((*ctx.m_pRequestsStatus)[i] != IOContext::READ_SUCCESS)
-        {
-            retval[i] = false;
-            continue;
-        }
+            if ((*ctx.m_pRequestsStatus)[i] != IOContext::READ_SUCCESS)
+            {
+                retval[i] = false;
+                continue;
+            }
 #endif
 
-        char *node_buf = offset_to_node((char *)read_reqs[i].buf, node_ids[i]);
+            char *node_buf = offset_to_node((char *)read_reqs[i].buf, node_ids[i]);
 
-        if (coord_buffers[i] != nullptr)
+            if (coord_buffers[i] != nullptr)
+            {
+                T *node_coords = offset_to_node_coords(node_buf);
+                memcpy(coord_buffers[i], node_coords, _disk_bytes_per_point);
+            }
+
+            if (nbr_buffers[i].second != nullptr)
+            {
+                uint32_t *node_nhood = offset_to_node_nhood(node_buf);
+                auto num_nbrs = *node_nhood;
+                nbr_buffers[i].first = num_nbrs;
+                memcpy(nbr_buffers[i].second, node_nhood + 1, num_nbrs * sizeof(uint32_t));
+            }
+        }
+        aligned_free(buf);
+
+#ifdef NDEBUG
+        // done with the normal path
+        return retval;
+    }
+#endif
+    {
+        // 计算每个节点的分区偏移
+        std::vector<std::pair<uint64_t, uint64_t>> offsets(node_ids.size());
+        std::vector<bool> valid_nodes(node_ids.size(), true);
+
+        // 按分区分组，减少重复读取相同分区
+        std::map<uint32_t, std::vector<size_t>> partition_to_indices;
+
+        // 遍历所有节点，获取其分区信息
+        for (size_t i = 0; i < node_ids.size(); i++)
         {
-            T *node_coords = offset_to_node_coords(node_buf);
-            memcpy(coord_buffers[i], node_coords, _disk_bytes_per_point);
+            uint32_t node_id = node_ids[i];
+            if (nbr_buffers[i].second != nullptr)
+            {
+                // 使用read_neighbors中的逻辑获取分区ID
+                uint32_t partition_id = _id2partition[node_id];
+                if (partition_id >= _num_partitions)
+                {
+                    valid_nodes[i] = false;
+                    retval[i] = false;
+                    continue;
+                }
+
+                // 将节点按分区ID分组
+                partition_to_indices[partition_id].push_back(i);
+            }
         }
 
-        if (nbr_buffers[i].second != nullptr)
+        // 对每个分区执行一次读取
+        for (const auto &pair : partition_to_indices)
         {
-            uint32_t *node_nhood = offset_to_node_nhood(node_buf);
-            auto num_nbrs = *node_nhood;
-            nbr_buffers[i].first = num_nbrs;
-            memcpy(nbr_buffers[i].second, node_nhood + 1, num_nbrs * sizeof(uint32_t));
+            uint32_t partition_id = pair.first;
+            const auto &indices = pair.second;
+
+            // 计算扇区偏移 (与read_neighbors中相同)
+            uint64_t sector_offset = (partition_id + 1) * defaults::SECTOR_LEN;
+
+            // 读取分区扇区
+            char *sector_buf = nullptr;
+            alloc_aligned((void **)&sector_buf, defaults::SECTOR_LEN, defaults::SECTOR_LEN);
+
+            AlignedRead read;
+            read.len = defaults::SECTOR_LEN;
+            read.buf = sector_buf;
+            read.offset = sector_offset;
+
+            std::vector<AlignedRead> single_read = {read};
+            graph_reader->read(single_read, ctx);
+
+            // 处理该分区中的所有节点
+            for (size_t idx : indices)
+            {
+                uint32_t node_id = node_ids[idx];
+
+                // 查找节点在分区内的位置 (与read_neighbors中相同)
+                const auto &part_list = _graph_partitions[partition_id];
+                auto it = std::find(part_list.begin(), part_list.end(), node_id);
+                if (it == part_list.end())
+                {
+                    retval[idx] = false;
+                    continue;
+                }
+                size_t j = std::distance(part_list.begin(), it);
+
+                // 计算节点在扇区内的偏移 (与read_neighbors中相同)
+                uint64_t node_offset = j * _graph_node_len;
+                if (node_offset + 4 > defaults::SECTOR_LEN)
+                {
+                    retval[idx] = false;
+                    continue;
+                }
+
+                // 读取邻居数量
+                char *adjacency_ptr = sector_buf + node_offset;
+                uint32_t neighbor_count = *reinterpret_cast<uint32_t *>(adjacency_ptr);
+
+                // 检查邻居数据是否超出扇区范围
+                size_t needed = neighbor_count * sizeof(uint32_t);
+                if (node_offset + 4 + needed > defaults::SECTOR_LEN)
+                {
+                    retval[idx] = false;
+                    continue;
+                }
+
+                // 拷贝邻居数据
+                nbr_buffers[idx].first = neighbor_count;
+                memcpy(nbr_buffers[idx].second, adjacency_ptr + 4, needed);
+            }
+
+            aligned_free(sector_buf);
         }
     }
-
-    aligned_free(buf);
 
     return retval;
 }
@@ -781,42 +888,189 @@ int PQFlashIndex<T, LabelT>::load(uint32_t num_threads, const char *index_prefix
     std::string pq_table_bin = std::string(pq_prefix) + "_pq_pivots.bin";
     std::string pq_compressed_vectors = std::string(pq_prefix) + "_pq_compressed.bin";
     std::string _disk_index_file = std::string(index_prefix) + "_disk.index";
+    std::string graph_file = std::string(_disk_index_file) + "_disk_graph.index";
 #ifdef EXEC_ENV_OLS
     return load_from_separate_paths(files, num_threads, _disk_index_file.c_str(), pq_table_bin.c_str(),
-                                    pq_compressed_vectors.c_str());
+                                    pq_compressed_vectors.c_str(), graph_file.c_str());
 #else
     return load_from_separate_paths(num_threads, _disk_index_file.c_str(), pq_table_bin.c_str(),
-                                    pq_compressed_vectors.c_str());
+                                    pq_compressed_vectors.c_str(), graph_file.c_str());
 #endif
 }
+
+template <typename T, typename LabelT>
+int PQFlashIndex<T, LabelT>::read_partition_info(const std::string &partition_bin)
+{
+    std::ifstream pf(partition_bin, std::ios::binary);
+    if (!pf.is_open())
+    {
+        std::cerr << "Cannot open partition.bin: " << partition_bin << std::endl;
+        return 1;
+    }
+    uint64_t C, nd;
+    READ_U64(pf, C);
+    READ_U64(pf, _num_partitions);
+    READ_U64(pf, nd);
+    std::cout << "[partition.bin header] C=" << C << ", partition_nums=" << _num_partitions << ", nd=" << nd
+              << std::endl;
+
+    // 读取分区节点列表
+    _graph_partitions.resize(_num_partitions);
+    for (uint64_t i = 0; i < _num_partitions; i++)
+    {
+        uint32_t psize;
+        READ_U32(pf, psize);
+        _graph_partitions[i].resize(psize);
+        pf.read(reinterpret_cast<char *>(_graph_partitions[i].data()), psize * sizeof(uint32_t));
+    }
+    // 读取 _id2partition[node], 大小= nd
+    _id2partition.resize(nd);
+    pf.read(reinterpret_cast<char *>(_id2partition.data()), nd * sizeof(uint32_t));
+    pf.close();
+    std::cout << "Done loading partition info.\n";
+
+    return 0;
+}
+
+template <typename T, typename LabelT>
+int PQFlashIndex<T, LabelT>::load_graph_index(const std::string &graph_index_file)
+{
+    std::ifstream gf(graph_index_file, std::ios::binary);
+    if (!gf.is_open())
+    {
+        std::cerr << "Cannot open disk_graph.index: " << graph_index_file << std::endl;
+        return 1;
+    }
+    // (a) sector0 => 先读 2个 int
+    int meta_n, meta_dim;
+    gf.read((char *)&meta_n, sizeof(int));
+    gf.read((char *)&meta_dim, sizeof(int));
+    std::cout << "[debug] meta_n=" << meta_n << ", meta_dim=" << meta_dim << "\n";
+
+    // (b) 读 meta_n个 uint64_t
+    std::vector<uint64_t> meta_info(meta_n);
+    gf.read(reinterpret_cast<char *>(meta_info.data()), meta_n * sizeof(uint64_t));
+    // 打印
+    for (int i = 0; i < meta_n; i++)
+    {
+        std::cout << " meta_info[" << i << "]= " << meta_info[i] << "\n";
+    }
+
+    size_t file_size = get_file_size(graph_index_file);
+    std::cout << "[disk_graph.index size] " << file_size << " bytes\n";
+
+    uint64_t nd_in_meta = meta_info[0];
+    uint64_t dim_in_meta = meta_info[1];
+    uint64_t max_node_len = meta_info[3];
+    uint64_t c_in_meta = meta_info[4];
+    uint64_t entire_file_sz = meta_info[8];
+
+    std::cout << "Based on meta_info:\n"
+              << "  nd_in_meta= " << nd_in_meta << ", dim_in_meta= " << dim_in_meta
+              << ", max_node_len= " << max_node_len << ", c_in_meta= " << c_in_meta
+              << ", entire_file_size= " << entire_file_sz << "\n";
+
+    uint64_t dim_size = dim_in_meta * sizeof(float);
+
+    _graph_node_len = max_node_len - dim_size;
+    std::cout << " => graph_node_len= " << _graph_node_len << "\n\n";
+
+    return 0;
+}
+
+// template <typename T, typename LabelT>
+// int PQFlashIndex<T, LabelT>::read_neighbors(const std::string &graph_index_file, uint64_t target_node_id)
+// {
+//     // target_node_id => partition_id => subIndex
+//     uint32_t partition_id = _id2partition[target_node_id];
+//     if (partition_id >= _num_partitions)
+//     {
+//         std::cerr << "Partition ID out-of-range.\n";
+//         return 1;
+//     }
+//     auto &part_list = _graph_partitions[partition_id];
+//     auto it = std::find(part_list.begin(), part_list.end(), (uint32_t)target_node_id);
+//     if (it == part_list.end())
+//     {
+//         std::cerr << "Cannot find node " << target_node_id << " in partition " << partition_id << std::endl;
+//         return 1;
+//     }
+//     size_t j = std::distance(part_list.begin(), it);
+
+//     // sector => (partition_id+1)* 4096
+//     uint64_t sector_offset = (partition_id + 1) * defaults::SECTOR_LEN;
+//     gf.seekg(sector_offset, std::ios::beg);
+//     std::vector<char> sectorBuf(defaults::SECTOR_LEN);
+//     gf.read(sectorBuf.data(), defaults::SECTOR_LEN);
+
+//     std::cout << "Partition #" << partition_id << ", nodeCount= " << part_list.size() << ", offset= " <<
+//     sector_offset
+//               << "\n"
+//               << " first64 hex:\n   ";
+//     print_hex(sectorBuf.data(), defaults::SECTOR_LEN, 64);
+
+//     // adjacency_offset= j* graph_node_len
+//     uint64_t node_offset = j * graph_node_len;
+//     if (node_offset + 4 > defaults::SECTOR_LEN)
+//     {
+//         std::cerr << "Out-of-range. j=" << j << ", node_offset=" << node_offset
+//                   << ", node_offset+4=" << (node_offset + 4) << "> 4096\n";
+//         return 1;
+//     }
+
+//     char *adjacency_ptr = sectorBuf.data() + node_offset;
+//     uint32_t neighbor_count = *reinterpret_cast<uint32_t *>(adjacency_ptr);
+//     std::cout << "[Node " << target_node_id << "] partition=" << partition_id << ", subIndex=" << j
+//               << ", adjacency_offset=" << node_offset << ", neighbor_count=" << neighbor_count << "\n";
+
+//     size_t needed = neighbor_count * sizeof(uint32_t);
+//     if (node_offset + 4 + needed > SECTOR_SIZE)
+//     {
+//         std::cerr << "Neighbors partly out-of-range => neighbor_count=" << neighbor_count << "\n";
+//         return 1;
+//     }
+//     std::vector<uint32_t> neighbors(neighbor_count);
+//     memcpy(neighbors.data(), adjacency_ptr + 4, needed);
+
+//     std::cout << "  neighbors=[";
+//     for (size_t kk = 0; kk < std::min<size_t>(10, neighbor_count); kk++)
+//     {
+//         std::cout << neighbors[kk];
+//         if (kk + 1 < std::min<size_t>(10, neighbor_count))
+//             std::cout << ", ";
+//     }
+//     if (neighbor_count > 10)
+//         std::cout << " ... (total " << neighbor_count << ")";
+//     std::cout << "]\n";
+
+//     gf.close();
+// }
 
 #ifdef EXEC_ENV_OLS
 template <typename T, typename LabelT>
 int PQFlashIndex<T, LabelT>::load_from_separate_paths(diskann::MemoryMappedFiles &files, uint32_t num_threads,
                                                       const char *index_filepath, const char *pivots_filepath,
-                                                      const char *compressed_filepath)
+                                                      const char *compressed_filepath, const char *graph_filepath)
 {
 #else
 template <typename T, typename LabelT>
 int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, const char *index_filepath,
-                                                      const char *pivots_filepath, const char *compressed_filepath)
+                                                      const char *pivots_filepath, const char *compressed_filepath,
+                                                      const char *graph_file)
 {
 #endif
     std::string pq_table_bin = pivots_filepath;
     std::string pq_compressed_vectors = compressed_filepath;
     std::string _disk_index_file = index_filepath;
-    // Don't have this one
+    // medoids, etc.
     std::string medoids_file = std::string(_disk_index_file) + "_medoids.bin";
     std::string centroids_file = std::string(_disk_index_file) + "_centroids.bin";
 
-    // NO
-    std::string labels_file = std ::string(_disk_index_file) + "_labels.txt";
-    // NO
-    std::string labels_to_medoids = std ::string(_disk_index_file) + "_labels_to_medoids.txt";
-    // NO
-    std::string dummy_map_file = std ::string(_disk_index_file) + "_dummy_map.txt";
-    // NO
-    std::string labels_map_file = std ::string(_disk_index_file) + "_labels_map.txt";
+    std::string labels_file = std::string(_disk_index_file) + "_labels.txt";
+    std::string labels_to_medoids = std::string(_disk_index_file) + "_labels_to_medoids.txt";
+    std::string dummy_map_file = std::string(_disk_index_file) + "_dummy_map.txt";
+    std::string labels_map_file = std::string(_disk_index_file) + "_labels_map.txt";
+
     size_t num_pts_in_label_file = 0;
 
     size_t pq_file_dim = 0, pq_file_num_centroids = 0;
@@ -1048,6 +1302,11 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
 #else
     diskann::cout << "Loading index metadata from " << _disk_index_file << std::endl;
     std::ifstream index_metadata(_disk_index_file, std::ios::binary);
+    if (!index_metadata.is_open())
+    {
+        diskann::cout << "Error: Could not open index metadata file: " << _disk_index_file << std::endl;
+        return -1;
+    }
 #endif
 
     uint32_t nr, nc; // metadata itself is stored as bin format (nr is number of
@@ -1124,6 +1383,10 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     // open AlignedFileReader handle to index_file
     std::string index_fname(_disk_index_file);
     reader->open(index_fname);
+
+    diskann::cout << "Disk-Index Meta: nodes per sector: " << _nnodes_per_sector << ", max node len: " << _max_node_len
+                  << ", max node degree: " << _max_degree << std::endl;
+
     this->setup_thread_data(num_threads);
     this->_max_nthreads = num_threads;
 
@@ -1210,7 +1473,15 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
         diskann::cout << "Setting re-scaling factor of base vectors to " << this->_max_base_norm << std::endl;
         delete[] norm_val;
     }
-    diskann::cout << "done.." << std::endl;
+
+    std::string partition_file = "/starling/_M_R_L_B/GRAPH/_partition.bin";
+    read_partition_info(partition_file);
+
+    this->_graph_index_file = "/starling/_M_R_L_B/GRAPH/_disk_graph.index";
+    graph_reader->open(this->_graph_index_file);
+    load_graph_index(this->_graph_index_file);
+
+    diskann::cout << "load_from_separate_paths done." << std::endl;
     return 0;
 }
 
@@ -1262,10 +1533,11 @@ template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_reorder_data, QueryStats *stats,
-                                                 bool USE_DEFERRED_FETCH, bool skip_search_reorder)
+                                                 bool USE_DEFERRED_FETCH, bool skip_search_reorder,
+                                                 const bool partition_read)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, std::numeric_limits<uint32_t>::max(),
-                       use_reorder_data, stats, USE_DEFERRED_FETCH, skip_search_reorder);
+                       use_reorder_data, stats, USE_DEFERRED_FETCH, skip_search_reorder, partition_read);
 }
 
 template <typename T, typename LabelT>
@@ -1273,22 +1545,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
                                                  const bool use_reorder_data, QueryStats *stats,
-                                                 bool USE_DEFERRED_FETCH, bool skip_search_reorder)
+                                                 bool USE_DEFERRED_FETCH, bool skip_search_reorder,
+                                                 const bool partition_read)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, use_filter, filter_label,
                        std::numeric_limits<uint32_t>::max(), use_reorder_data, stats, USE_DEFERRED_FETCH,
-                       skip_search_reorder);
+                       skip_search_reorder, partition_read);
 }
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const uint32_t io_limit, const bool use_reorder_data,
-                                                 QueryStats *stats, bool USE_DEFERRED_FETCH, bool skip_search_reorder)
+                                                 QueryStats *stats, bool USE_DEFERRED_FETCH, bool skip_search_reorder,
+                                                 const bool partition_read)
 {
     LabelT dummy_filter = 0;
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, false, dummy_filter, io_limit,
-                       use_reorder_data, stats, USE_DEFERRED_FETCH, skip_search_reorder);
+                       use_reorder_data, stats, USE_DEFERRED_FETCH, skip_search_reorder, partition_read);
 }
 
 // A helper callback for cURL
@@ -1467,10 +1741,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
                                                  const uint32_t io_limit, const bool use_reorder_data,
-                                                 QueryStats *stats, bool USE_DEFERRED_FETCH, bool skip_search_reorder)
+                                                 QueryStats *stats, bool USE_DEFERRED_FETCH, bool skip_search_reorder,
+                                                 const bool partition_read)
 {
-    // printf("cached_beam_search\n");
-    // diskann::cout << "cached_beam_search" << std::endl;
+    // assert(USE_DEFERRED_FETCH);
+
     uint64_t num_sector_per_nodes = DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
     if (beam_width > num_sector_per_nodes * defaults::MAX_N_SECTOR_READS)
         throw ANNException("Beamwidth can not be higher than defaults::MAX_N_SECTOR_READS", -1, __FUNCSIG__, __FILE__,
@@ -1706,35 +1981,108 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
         }
 
+        std::vector<AlignedRead> graph_read_reqs;
+        std::map<uint32_t, int> node_offsets; // id -> offset
+        std::map<uint32_t, std::vector<uint32_t>> node_nbrs_ori;
+
         // read nhoods of frontier ids
         if (!frontier.empty())
         {
             if (stats != nullptr)
                 stats->n_hops++;
-            for (uint64_t i = 0; i < frontier.size(); i++)
+
+#ifdef NDEBUG
+            if (!partition_read)
             {
-                auto id = frontier[i];
-                std::pair<uint32_t, char *> fnhood;
-                fnhood.first = id;
-                fnhood.second = sector_scratch + num_sectors_per_node * sector_scratch_idx * defaults::SECTOR_LEN;
-                sector_scratch_idx++;
-                frontier_nhoods.push_back(fnhood);
-                frontier_read_reqs.emplace_back(get_node_sector((size_t)id) * defaults::SECTOR_LEN,
-                                                num_sectors_per_node * defaults::SECTOR_LEN, fnhood.second);
-                if (stats != nullptr)
+#endif
+                for (uint64_t i = 0; i < frontier.size(); i++)
                 {
-                    stats->n_4k++;
-                    stats->n_ios++;
+                    auto id = frontier[i];
+                    std::pair<uint32_t, char *> fnhood;
+                    fnhood.first = id;
+                    fnhood.second = sector_scratch + num_sectors_per_node * sector_scratch_idx * defaults::SECTOR_LEN;
+                    sector_scratch_idx++;
+                    frontier_nhoods.push_back(fnhood);
+                    frontier_read_reqs.emplace_back(get_node_sector((size_t)id) * defaults::SECTOR_LEN,
+                                                    num_sectors_per_node * defaults::SECTOR_LEN, fnhood.second);
+                    if (stats != nullptr)
+                    {
+                        stats->n_4k++;
+                        stats->n_ios++;
+                    }
+                    num_ios++;
                 }
-                num_ios++;
+#ifdef NDEBUG
             }
+#endif
+
+            if (partition_read)
+            {
+                sector_scratch_idx = 0;
+                for (auto &frontier_nhood : frontier_nhoods)
+                {
+                    uint32_t node_id = frontier_nhood.first;
+                    uint32_t partition_id = _id2partition[node_id];
+                    if (partition_id >= _num_partitions)
+                    {
+                        diskann::cout << "Warning: partition_id is invalid: " << partition_id << std::endl;
+                        assert(false);
+                    }
+
+                    std::vector<uint32_t> part_list = _graph_partitions[partition_id];
+                    auto it = std::find(part_list.begin(), part_list.end(), node_id);
+                    if (it == part_list.end())
+                    {
+                        diskann::cerr << "Error: node " << node_id << " not found in partition " << partition_id
+                                      << std::endl;
+                        assert(false);
+                    }
+                    size_t j = std::distance(part_list.begin(), it);
+                    node_offsets[node_id] = j;
+
+                    uint64_t sector_offset = (partition_id + 1) * defaults::SECTOR_LEN;
+                    // ! Keep it same with frontier_nhood.second
+                    char *sector_buffer = sector_scratch + sector_scratch_idx * defaults::SECTOR_LEN;
+                    sector_scratch_idx++;
+
+                    AlignedRead partition_read;
+                    partition_read.len = defaults::SECTOR_LEN;
+                    partition_read.buf = sector_buffer;
+                    partition_read.offset = sector_offset;
+
+                    graph_read_reqs.emplace_back(partition_read);
+                }
+            }
+
             io_timer.reset();
+#ifdef NDEBUG
+            if (partition_read)
+            {
+#endif
 #ifdef USE_BING_INFRA
-            reader->read(frontier_read_reqs, ctx,
-                         true); // asynhronous reader for Bing.
+                reader->read(frontier_read_reqs, ctx,
+                             true); // asynhronous reader for Bing.
 #else
             reader->read(frontier_read_reqs, ctx); // synchronous IO linux
 #endif
+#ifdef NDEBUG
+            }
+#endif
+
+#ifndef NDEBUG
+            for (auto &[node_id, disk_buf] : frontier_nhoods)
+            {
+                char *node_disk_buf = offset_to_node(disk_buf, node_id);
+                uint32_t *nhood_buf = offset_to_node_nhood(node_disk_buf);
+                uint32_t neighbor_count = *nhood_buf;
+                node_nbrs_ori[node_id] = std::vector<uint32_t>(nhood_buf + 1, nhood_buf + 1 + neighbor_count);
+            }
+#endif
+            if (partition_read)
+            {
+                graph_reader->read(graph_read_reqs, ctx);
+            }
+
             if (stats != nullptr)
             {
                 stats->io_us += (float)io_timer.elapsed();
@@ -1832,17 +2180,15 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             auto &frontier_nhood = frontier_nhoods[completedIndex];
             (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
 #else
+
         for (auto &frontier_nhood : frontier_nhoods)
         {
 #endif
             uint32_t node_id = frontier_nhood.first;
-            char *node_disk_buf = offset_to_node(frontier_nhood.second, node_id);
-            uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
-            uint64_t nnbrs = (uint64_t)(*node_buf);
-            T *node_fp_coords = offset_to_node_coords(node_disk_buf);
-            memcpy(data_buf, node_fp_coords, _disk_bytes_per_point);
+            char *disk_buf = frontier_nhood.second;
+            char *node_disk_buf = offset_to_node(disk_buf, node_id);
+
             float cur_expanded_dist;
-            float exact_expanded_dist = 0;
 
             // If skip_reorder is true, compute both PQ distance and exact distance
             if (skip_search_reorder)
@@ -1854,20 +2200,28 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 cur_expanded_dist = 0.0f;
             }
-            else if (!_use_disk_index_pq)
-            {
-                cur_expanded_dist = _dist_cmp->compare(aligned_query_T, data_buf, (uint32_t)_aligned_dim);
-            }
             else
             {
-                if (metric == diskann::Metric::INNER_PRODUCT)
-                    cur_expanded_dist = _disk_pq_table.inner_product(query_float, (uint8_t *)data_buf);
+                T *node_fp_coords = offset_to_node_coords(node_disk_buf);
+                memcpy(data_buf, node_fp_coords, _disk_bytes_per_point);
+                if (!_use_disk_index_pq)
+                {
+                    cur_expanded_dist = _dist_cmp->compare(aligned_query_T, data_buf, (uint32_t)_aligned_dim);
+                }
                 else
-                    cur_expanded_dist = _disk_pq_table.l2_distance(query_float, (uint8_t *)data_buf);
+                {
+                    if (metric == diskann::Metric::INNER_PRODUCT)
+                        cur_expanded_dist = _disk_pq_table.inner_product(query_float, (uint8_t *)data_buf);
+                    else
+                        cur_expanded_dist = _disk_pq_table.l2_distance(query_float, (uint8_t *)data_buf);
+                }
             }
             full_retset.push_back(Neighbor(node_id, cur_expanded_dist));
 
 #ifndef NDEBUG
+            T *node_fp_coords = offset_to_node_coords(node_disk_buf);
+            memcpy(data_buf, node_fp_coords, _disk_bytes_per_point);
+            float exact_expanded_dist = 0;
             if (!_use_disk_index_pq)
             {
                 exact_expanded_dist = _dist_cmp->compare(aligned_query_T, data_buf, (uint32_t)_aligned_dim);
@@ -1883,7 +2237,78 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             exact_embeddings.push_back(std::vector<float>(data_buf, data_buf + _disk_bytes_per_point));
 #endif
 
-            uint32_t *node_nbrs = (node_buf + 1);
+            uint32_t *node_nbrs;
+            uint64_t nnbrs;
+
+            if (!partition_read)
+            {
+                auto node_buf = offset_to_node_nhood(node_disk_buf);
+                nnbrs = (uint64_t)(*node_buf);
+                node_nbrs = (node_buf + 1);
+            }
+
+#ifndef NDEBUG
+            auto node_nbrs_vec = node_nbrs_ori[node_id];
+            nnbrs = node_nbrs_vec.size();
+            node_nbrs = node_nbrs_vec.data();
+#endif
+            if (partition_read)
+            {
+                char *sector_buffer = frontier_nhood.second;
+                int j = node_offsets[node_id];
+                uint64_t node_offset = j * _graph_node_len;
+                if (node_offset + 4 > defaults::SECTOR_LEN)
+                {
+                    diskann::cerr << "Error: node offset out of range: " << node_offset << " (+4) > "
+                                  << defaults::SECTOR_LEN << " for node " << node_id << std::endl;
+                    assert(false);
+                }
+
+                char *adjacency_ptr = sector_buffer + node_offset;
+                uint32_t neighbor_count = *reinterpret_cast<uint32_t *>(adjacency_ptr);
+
+                if (neighbor_count > 10000)
+                {
+                    diskann::cerr << "Error: suspicious neighbor count: " << neighbor_count << " for node " << node_id
+                                  << std::endl;
+                    assert(false);
+                }
+
+                size_t needed = neighbor_count * sizeof(uint32_t);
+                if (node_offset + 4 + needed > defaults::SECTOR_LEN)
+                {
+                    diskann::cerr << "Error: neighbor data out of range: " << (node_offset + 4 + needed) << " > "
+                                  << defaults::SECTOR_LEN << " for node " << node_id << std::endl;
+                    assert(false);
+                }
+
+#ifndef NDEBUG
+                if (neighbor_count != nnbrs)
+                {
+                    diskann::cout << "Warning: neighbor_count != nnbrs: " << neighbor_count << " != " << nnbrs
+                                  << std::endl;
+                    assert(false);
+                }
+#endif
+
+                nnbrs = neighbor_count;
+
+#ifndef NDEBUG
+                uint32_t *our_node_nbrs = (uint32_t *)(adjacency_ptr + 4);
+                for (uint32_t i = 0; i < nnbrs; i++)
+                {
+                    if (our_node_nbrs[i] != node_nbrs[i])
+                    {
+                        diskann::cout << "Warning: our_node_nbrs[" << i << "] != node_nbrs[" << i
+                                      << "]: " << our_node_nbrs[i] << " != " << node_nbrs[i] << std::endl;
+                        assert(false);
+                    }
+                }
+#endif
+
+                node_nbrs = reinterpret_cast<uint32_t *>(adjacency_ptr + 4);
+            }
+
             // compute node_nbrs <-> query dist in PQ space
             cpu_timer.reset();
 
@@ -1924,11 +2349,13 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 stats->cpu_us += (float)cpu_timer.elapsed();
             }
         }
-
+        // }
+        // }
         hops++;
     }
 
-    // timer
+    diskann::cout << "Graph traversal completed, hops: " << hops << std::endl;
+
     if (USE_DEFERRED_FETCH)
     {
         diskann::cout << "hops: " << hops << std::endl;
@@ -1948,8 +2375,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             throw ANNException("Failed to fetch embeddings", -1, __FUNCSIG__, __FILE__, __LINE__);
         }
 
-        diskann::cout << "real_embeddings.size(): " << real_embeddings.size() << std::endl;
-        diskann::cout << "fetch_timer.elapsed(): " << fetch_timer.elapsed() << std::endl;
+        diskann::cout << "Fetched " << real_embeddings.size() << " embeddings in " << fetch_timer.elapsed() << " us"
+                      << std::endl;
 
         // compute real-dist
         Timer compute_timer;
@@ -2022,7 +2449,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
     std::sort(full_retset.begin(), full_retset.end());
 
-    // Compare PQ results with exact results when skip_search_reorder is true
+// Compare PQ results with exact results when skip_search_reorder is true
 #ifndef NDEBUG
     if (skip_search_reorder)
     {
