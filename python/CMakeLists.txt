@@ -69,13 +69,14 @@ if(NOT VERSION_INFO)
 endif()
 target_compile_definitions(_diskannpy PRIVATE VERSION_INFO="${VERSION_INFO}")
 
-option(UPDATE_EDITABLE_INSTALL "Update the editable install location with the built module" OFF)
-
+# Add a post-build command to automatically copy the compiled Python module
 if(UPDATE_EDITABLE_INSTALL)
-  add_custom_target(update_editable_install ALL
-      DEPENDS _diskannpy
-      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/python/src/
-      COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:_diskannpy> ${CMAKE_SOURCE_DIR}/python/src/
-      COMMENT "Updating editable install"
-  )
+add_custom_command(
+TARGET _diskannpy
+POST_BUILD
+COMMAND ${CMAKE_COMMAND} -E copy 
+        ${CMAKE_CURRENT_BINARY_DIR}/_diskannpy.cpython-*.so
+        ${CMAKE_SOURCE_DIR}/python/src/
+COMMENT "Copying Python module to python/src directory"
+)
 endif()

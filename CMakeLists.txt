@@ -19,6 +19,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(diskann)
 
+#Set option to use tcmalloc
+option(USE_TCMALLOC "Use tcmalloc from gperftools" ON)
+
+# set tcmalloc to false when on macos
+if(APPLE)
+    set(USE_TCMALLOC OFF)
+endif()
+
 option(PYBIND "Build with Python bindings" ON)
 
 if(PYBIND)
@@ -80,16 +88,27 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
+include(FetchContent)
+
+if(USE_TCMALLOC)
+    FetchContent_Declare(
+        tcmalloc
+        GIT_REPOSITORY https://github.com/google/tcmalloc.git
+        GIT_TAG        origin/master  # or specify a particular version or commit
+    )
+
+    FetchContent_MakeAvailable(tcmalloc)
+endif()
+
 if(NOT PYBIND)
     set(DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS ON)
 endif()
 # It's necessary to include tcmalloc headers only if calling into MallocExtension interface.
 # For using tcmalloc in DiskANN tools, it's enough to just link with tcmalloc.
 if (DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
-    include_directories(${PROJECT_SOURCE_DIR}/gperftools/src)
-
+     include_directories(${tcmalloc_SOURCE_DIR}/src)
     if (MSVC)
-        include_directories(${PROJECT_SOURCE_DIR}/gperftools/src/windows)
+        include_directories(${tcmalloc_SOURCE_DIR}/src/windows)
     endif()
 endif()
 
@@ -106,6 +125,76 @@ if (MSVC)
     set(OPENMP_WINDOWS_RUNTIME_FILES
         "${DISKANN_MSVC_PACKAGES}/intelopenmp.redist.win/runtimes/win-x64/native/libiomp5md.dll"
         "${DISKANN_MSVC_PACKAGES}/intelopenmp.redist.win/runtimes/win-x64/native/libiomp5md.pdb")
+elseif(APPLE)
+    # Check if we're building Python bindings
+    if(PYBIND)
+        # First look for PyTorch's OpenMP to avoid conflicts
+        execute_process(
+            COMMAND ${Python_EXECUTABLE} -c "import os; import torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib', 'libomp.dylib'))"
+            RESULT_VARIABLE TORCH_PATH_RESULT
+            OUTPUT_VARIABLE TORCH_LIBOMP_PATH
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+
+        execute_process(
+            COMMAND brew --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_ROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        
+        if(EXISTS "${TORCH_LIBOMP_PATH}")
+            message(STATUS "Found PyTorch's libomp: ${TORCH_LIBOMP_PATH}")
+            set(OpenMP_CXX_FLAGS "-Xclang -fopenmp")
+            set(OpenMP_C_FLAGS "-Xclang -fopenmp")
+            set(OpenMP_CXX_LIBRARIES "${TORCH_LIBOMP_PATH}")
+            set(OpenMP_C_LIBRARIES "${TORCH_LIBOMP_PATH}")
+            set(OpenMP_FOUND TRUE)
+
+            include_directories(${LIBOMP_ROOT}/include)
+            
+            # Set compiler flags and link libraries
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+            link_libraries("${TORCH_LIBOMP_PATH}")
+        else()
+            message(STATUS "No PyTorch's libomp found, falling back to normal OpenMP detection")
+            # Fallback to normal OpenMP detection
+            execute_process(
+                COMMAND brew --prefix libomp
+                OUTPUT_VARIABLE LIBOMP_ROOT
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+
+            set(OpenMP_ROOT "${LIBOMP_ROOT}")
+            find_package(OpenMP)
+            
+            if (OPENMP_FOUND)
+                set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+                set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+                link_libraries(OpenMP::OpenMP_CXX)
+            else()
+                message(FATAL_ERROR "No OpenMP support")
+            endif()
+        endif()
+    else()
+        # Regular OpenMP setup for non-Python builds
+        execute_process(
+            COMMAND brew --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_ROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        set(OpenMP_ROOT "${LIBOMP_ROOT}")
+        find_package(OpenMP)
+        
+        if (OPENMP_FOUND)
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+            link_libraries(OpenMP::OpenMP_CXX)
+        else()
+            message(FATAL_ERROR "No OpenMP support")
+        endif()
+    endif()
 else()
     find_package(OpenMP)
 
@@ -170,6 +259,12 @@ if (MSVC)
         "${DISKANN_MKL_LIB_PATH}/mkl_intel_ilp64.lib"
         "${DISKANN_MKL_LIB_PATH}/mkl_core.lib"
         "${DISKANN_MKL_LIB_PATH}/mkl_intel_thread.lib")
+elseif(APPLE)
+    # no mkl on non-intel devices
+    find_library(ACCELERATE_LIBRARY Accelerate)
+    message(STATUS "Found Accelerate (${ACCELERATE_LIBRARY})")
+    set(DISKANN_ACCEL_LINK_OPTIONS ${ACCELERATE_LIBRARY})
+    add_compile_definitions(ACCELERATE_NEW_LAPACK)
 else()
     # expected path for manual intel mkl installs
     set(POSSIBLE_OMP_PATHS "/opt/intel/oneapi/compiler/2025.0/lib/libiomp5.so;/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64_lin/libiomp5.so;/usr/lib/x86_64-linux-gnu/libiomp5.so;/opt/intel/lib/intel64_lin/libiomp5.so")
@@ -212,7 +307,7 @@ else()
     link_directories(${MKL_PATH})
     include_directories(${MKL_INCLUDE_PATH})
 
-    # compile flags and link libraries
+    # compile flags and link libraries 
     add_compile_options(-m64 -Wl,--no-as-needed)
     if (NOT PYBIND)
         link_libraries(mkl_intel_ilp64 mkl_intel_thread mkl_core iomp5 pthread m dl)
@@ -235,64 +330,74 @@ else()
             )
         endif()
     endif()
+
+    add_definitions(-DMKL_ILP64)
 endif()
 
-add_definitions(-DMKL_ILP64)
 
 # Section for tcmalloc. The DiskANN tools are always linked to tcmalloc. For Windows, they also need to
 # force-include the _tcmalloc symbol for enabling tcmalloc.
 #
 # The DLL itself needs to be linked to tcmalloc only if DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS
 # is enabled.
-if (MSVC)
-    if (NOT EXISTS "${PROJECT_SOURCE_DIR}/gperftools/gperftools.sln")
-        message(FATAL_ERROR "The gperftools submodule was not found. "
-                "Please check-out git submodules by doing 'git submodule init' followed by 'git submodule update'")
-    endif()
-
-    set(TCMALLOC_LINK_LIBRARY "${PROJECT_SOURCE_DIR}/gperftools/x64/Release-Patch/libtcmalloc_minimal.lib")
-    set(TCMALLOC_WINDOWS_RUNTIME_FILES
-        "${PROJECT_SOURCE_DIR}/gperftools/x64/Release-Patch/libtcmalloc_minimal.dll"
-        "${PROJECT_SOURCE_DIR}/gperftools/x64/Release-Patch/libtcmalloc_minimal.pdb")
-
-    # Tell CMake how to build the tcmalloc linker library from the submodule.
-    add_custom_target(build_libtcmalloc_minimal DEPENDS ${TCMALLOC_LINK_LIBRARY})
-    add_custom_command(OUTPUT ${TCMALLOC_LINK_LIBRARY}
-                        COMMAND ${CMAKE_VS_MSBUILD_COMMAND} gperftools.sln /m /nologo
-                            /t:libtcmalloc_minimal /p:Configuration="Release-Patch"
-                            /property:Platform="x64"
-                            /p:PlatformToolset=v${MSVC_TOOLSET_VERSION}
-                            /p:WindowsTargetPlatformVersion=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}
-                        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/gperftools)
- 
-    add_library(libtcmalloc_minimal_for_exe STATIC IMPORTED)
-    add_library(libtcmalloc_minimal_for_dll STATIC IMPORTED)
-
-    set_target_properties(libtcmalloc_minimal_for_dll PROPERTIES
-                          IMPORTED_LOCATION "${TCMALLOC_LINK_LIBRARY}")
-
-    set_target_properties(libtcmalloc_minimal_for_exe PROPERTIES
-                          IMPORTED_LOCATION "${TCMALLOC_LINK_LIBRARY}"
-                          INTERFACE_LINK_OPTIONS /INCLUDE:_tcmalloc)
-
-    # Ensure libtcmalloc_minimal is built before it's being used.
-    add_dependencies(libtcmalloc_minimal_for_dll build_libtcmalloc_minimal)
-    add_dependencies(libtcmalloc_minimal_for_exe build_libtcmalloc_minimal)
-
-    set(DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS libtcmalloc_minimal_for_exe)
-elseif(NOT PYBIND)
-    set(DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS "-ltcmalloc")
-endif()
-
-if (DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
-    add_definitions(-DRELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
-
+if(USE_TCMALLOC)
     if (MSVC)
-        set(DISKANN_DLL_TCMALLOC_LINK_OPTIONS libtcmalloc_minimal_for_dll)
+        if (NOT EXISTS "${PROJECT_SOURCE_DIR}/gperftools/gperftools.sln")
+            message(FATAL_ERROR "The gperftools submodule was not found. "
+                    "Please check-out git submodules by doing 'git submodule init' followed by 'git submodule update'")
+        endif()
+
+        set(TCMALLOC_LINK_LIBRARY "${PROJECT_SOURCE_DIR}/gperftools/x64/Release-Patch/libtcmalloc_minimal.lib")
+        set(TCMALLOC_WINDOWS_RUNTIME_FILES
+            "${PROJECT_SOURCE_DIR}/gperftools/x64/Release-Patch/libtcmalloc_minimal.dll"
+            "${PROJECT_SOURCE_DIR}/gperftools/x64/Release-Patch/libtcmalloc_minimal.pdb")
+
+        # Tell CMake how to build the tcmalloc linker library from the submodule.
+        add_custom_target(build_libtcmalloc_minimal DEPENDS ${TCMALLOC_LINK_LIBRARY})
+        add_custom_command(OUTPUT ${TCMALLOC_LINK_LIBRARY}
+                            COMMAND ${CMAKE_VS_MSBUILD_COMMAND} gperftools.sln /m /nologo
+                                /t:libtcmalloc_minimal /p:Configuration="Release-Patch"
+                                /property:Platform="x64"
+                                /p:PlatformToolset=v${MSVC_TOOLSET_VERSION}
+                                /p:WindowsTargetPlatformVersion=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}
+                            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/gperftools)
+
+        add_library(libtcmalloc_minimal_for_exe STATIC IMPORTED)
+        add_library(libtcmalloc_minimal_for_dll STATIC IMPORTED)
+
+        set_target_properties(libtcmalloc_minimal_for_dll PROPERTIES
+                            IMPORTED_LOCATION "${TCMALLOC_LINK_LIBRARY}")
+
+        set_target_properties(libtcmalloc_minimal_for_exe PROPERTIES
+                            IMPORTED_LOCATION "${TCMALLOC_LINK_LIBRARY}"
+                            INTERFACE_LINK_OPTIONS /INCLUDE:_tcmalloc)
+
+        # Ensure libtcmalloc_minimal is built before it's being used.
+        add_dependencies(libtcmalloc_minimal_for_dll build_libtcmalloc_minimal)
+        add_dependencies(libtcmalloc_minimal_for_exe build_libtcmalloc_minimal)
+
+        set(DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS libtcmalloc_minimal_for_exe)
+    elseif(APPLE) # ! Inherited from #474, not been adjusted for TCMalloc Removal
+        execute_process(
+            COMMAND brew --prefix gperftools
+            OUTPUT_VARIABLE GPERFTOOLS_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        set(DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS "-L${GPERFTOOLS_PREFIX}/lib -ltcmalloc")
+    elseif(NOT PYBIND)
+        set(DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS "-ltcmalloc")
+    endif()
+
+    if (DISKANN_RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
+        add_definitions(-DRELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS)
+
+        if (MSVC)
+            set(DISKANN_DLL_TCMALLOC_LINK_OPTIONS libtcmalloc_minimal_for_dll)
+        endif()
     endif()
 endif()
 
-if (NOT MSVC)
+if (NOT MSVC AND NOT APPLE)
     set(DISKANN_ASYNC_LIB aio)
 endif()
 
@@ -317,9 +422,26 @@ if(MSVC)
 	set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE ${PROJECT_SOURCE_DIR}/x64/Release)
 	set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${PROJECT_SOURCE_DIR}/x64/Release)
 	set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${PROJECT_SOURCE_DIR}/x64/Release)
+elseif(APPLE)
+    set(ENV{TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD} 500000000000)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -Xclang -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -Wno-inconsistent-missing-override -Wno-return-type")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -DDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Ofast -DNDEBUG -ftree-vectorize")
+    if (NOT PYBIND)
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -Ofast")
+        if (NOT PORTABLE)
+            set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mtune=native")
+        endif()
+    else()
+        # -Ofast is not supported in a python extension module
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -fPIC")
+    endif()
 else()
     set(ENV{TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD} 500000000000)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -fPIC")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -fPIC")
+    if(USE_TCMALLOC)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free")
+    endif()
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -DDEBUG")
     if (NOT PYBIND)
         set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -Ofast")

@@ -6,12 +6,15 @@
 #include <smmintrin.h>
 #include <tmmintrin.h>
 #include <intrin.h>
+#include <cosine_similarity.h>
+#include "simd_utils.h"
+#elif __APPLE__
+#include <Accelerate/Accelerate.h>
 #else
 #include <immintrin.h>
+#include "simd_utils.h"
 #endif
 
-#include "simd_utils.h"
-#include <cosine_similarity.h>
 #include <iostream>
 
 #include "distance.h"
@@ -199,7 +202,7 @@ float DistanceL2Float::compare(const float *a, const float *b, uint32_t size) co
         }
         __m256 a_vec = _mm256_load_ps(a + 8 * j);
         // load b_vec
-    __m256 b_vec = _mm256_load_ps(b + 8 * j);
+        __m256 b_vec = _mm256_load_ps(b + 8 * j);
         // a_vec - b_vec
         __m256 tmp_vec = _mm256_sub_ps(a_vec, b_vec);
 
@@ -383,6 +386,8 @@ template <typename T> float DistanceInnerProduct<T>::inner_product(const T *a, c
     }
     _mm_storeu_ps(unpack, sum);
     result += unpack[0] + unpack[1] + unpack[2] + unpack[3];
+#elif __APPLE__
+    vDSP_dotpr((float *)a, (vDSP_Stride)1, (float *)b, (vDSP_Stride)1, &result, size);
 #else
 
     float dot0, dot1, dot2, dot3;
@@ -492,6 +497,8 @@ template <typename T> float DistanceFastL2<T>::norm(const T *a, uint32_t size) c
     }
     _mm_storeu_ps(unpack, sum);
     result += unpack[0] + unpack[1] + unpack[2] + unpack[3];
+#elif __APPLE__
+    vDSP_dotpr((float *)a, 1, (float *)a, 1, &result, size);
 #else
     float dot0, dot1, dot2, dot3;
     const float *last = a + size;
@@ -522,6 +529,9 @@ template <typename T> float DistanceFastL2<T>::norm(const T *a, uint32_t size) c
 float AVXDistanceInnerProductFloat::compare(const float *a, const float *b, uint32_t size) const
 {
     float result = 0.0f;
+#ifdef __APPLE__
+    vDSP_dotpr(a, (vDSP_Stride)1, b, (vDSP_Stride)1, &result, size);
+#else
 #define AVX_DOT(addr1, addr2, dest, tmp1, tmp2)                                                                        \
     tmp1 = _mm256_loadu_ps(addr1);                                                                                     \
     tmp2 = _mm256_loadu_ps(addr2);                                                                                     \
@@ -557,7 +567,7 @@ float AVXDistanceInnerProductFloat::compare(const float *a, const float *b, uint
     }
     _mm256_storeu_ps(unpack, sum);
     result = unpack[0] + unpack[1] + unpack[2] + unpack[3] + unpack[4] + unpack[5] + unpack[6] + unpack[7];
-
+#endif
     return -result;
 }
 
@@ -726,8 +736,8 @@ template DISKANN_DLLEXPORT class SlowDistanceL2<float>;
 template DISKANN_DLLEXPORT class SlowDistanceL2<int8_t>;
 template DISKANN_DLLEXPORT class SlowDistanceL2<uint8_t>;
 
-template DISKANN_DLLEXPORT Distance<float> *get_distance_function(Metric m);
-template DISKANN_DLLEXPORT Distance<int8_t> *get_distance_function(Metric m);
-template DISKANN_DLLEXPORT Distance<uint8_t> *get_distance_function(Metric m);
+// template DISKANN_DLLEXPORT Distance<float> *get_distance_function(Metric m);
+// template DISKANN_DLLEXPORT Distance<int8_t> *get_distance_function(Metric m);
+// template DISKANN_DLLEXPORT Distance<uint8_t> *get_distance_function(Metric m);
 
 } // namespace diskann

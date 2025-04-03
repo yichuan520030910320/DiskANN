@@ -25,6 +25,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 {
   public:
     DISKANN_DLLEXPORT PQFlashIndex(std::shared_ptr<AlignedFileReader> &fileReader,
+                                   std::shared_ptr<AlignedFileReader> &graphReader,
                                    diskann::Metric metric = diskann::Metric::L2);
     DISKANN_DLLEXPORT ~PQFlashIndex();
 
@@ -33,16 +34,18 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                const char *pq_prefix = nullptr);
 #else
     // load compressed data, and obtains the handle to the disk-resident index
-    DISKANN_DLLEXPORT int load(uint32_t num_threads, const char *index_prefix, const char *pq_prefix = nullptr);
+    DISKANN_DLLEXPORT int load(uint32_t num_threads, const char *index_prefix, const char *pq_prefix = nullptr,
+                               const char *partition_prefix = nullptr);
 #endif
 
 #ifdef EXEC_ENV_OLS
     DISKANN_DLLEXPORT int load_from_separate_paths(diskann::MemoryMappedFiles &files, uint32_t num_threads,
                                                    const char *index_filepath, const char *pivots_filepath,
-                                                   const char *compressed_filepath);
+                                                   const char *compressed_filepath, const char *graph_file);
 #else
     DISKANN_DLLEXPORT int load_from_separate_paths(uint32_t num_threads, const char *index_filepath,
-                                                   const char *pivots_filepath, const char *compressed_filepath);
+                                                   const char *pivots_filepath, const char *compressed_filepath,
+                                                   const char *graph_file, const char *partition_file);
 #endif
 
     DISKANN_DLLEXPORT void load_cache_list(std::vector<uint32_t> &node_list);
@@ -151,6 +154,12 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // returns region of `node_buf` containing [COORD(T)]
     DISKANN_DLLEXPORT T *offset_to_node_coords(char *node_buf);
 
+    DISKANN_DLLEXPORT int load_graph_index(const std::string &graph_index_file);
+
+    DISKANN_DLLEXPORT int read_partition_info(const std::string &partition_bin);
+
+    DISKANN_DLLEXPORT int read_neighbors(const std::string &graph_index_file, uint64_t target_node_id);
+
     // index info for multi-node sectors
     // nhood of node `i` is in sector: [i / nnodes_per_sector]
     // offset in sector: [(i % nnodes_per_sector) * max_node_len]
@@ -167,7 +176,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     uint64_t _max_node_len = 0;
     uint64_t _nnodes_per_sector = 0; // 0 for multi-sector nodes, >0 for multi-node sectors
     uint64_t _max_degree = 0;
-
+    uint64_t _C = 0;
     // Data used for searching with re-order vectors
     uint64_t _ndims_reorder_vecs = 0;
     uint64_t _reorder_data_start_sector = 0;
@@ -248,6 +257,19 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     tsl::robin_map<uint32_t, uint32_t> _dummy_to_real_map;
     tsl::robin_map<uint32_t, std::vector<uint32_t>> _real_to_dummy_map;
     std::unordered_map<std::string, LabelT> _label_map;
+
+  private:
+    bool _use_partition = false;
+
+    std::shared_ptr<AlignedFileReader> graph_reader; // Graph file reader
+    std::string _graph_index_file;                   // Graph file path
+    uint64_t _graph_node_len;                        // Graph node length
+    uint64_t _emb_node_len;                          // Embedding node length
+
+    // Partition related data structures
+    uint64_t _num_partitions;                             // Number of partitions
+    std::vector<std::vector<uint32_t>> _graph_partitions; // Partition information
+    std::vector<uint32_t> _id2partition;                  // ID to partition mapping
 
 #ifdef EXEC_ENV_OLS
     // Set to a larger value than the actual header to accommodate

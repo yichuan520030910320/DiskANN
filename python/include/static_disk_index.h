@@ -11,6 +11,8 @@
 
 #ifdef _WINDOWS
 #include "windows_aligned_file_reader.h"
+#elif __APPLE__
+#include "apple_aligned_file_reader.h"
 #else
 #include "linux_aligned_file_reader.h"
 #endif
@@ -25,6 +27,8 @@ namespace diskannpy
 
 #ifdef _WINDOWS
 typedef WindowsAlignedFileReader PlatformSpecificAlignedFileReader;
+#elif __APPLE__
+typedef AppleAlignedFileReader PlatformSpecificAlignedFileReader;
 #else
 typedef LinuxAlignedFileReader PlatformSpecificAlignedFileReader;
 #endif
@@ -33,7 +37,8 @@ template <typename DT> class StaticDiskIndex
 {
   public:
     StaticDiskIndex(diskann::Metric metric, const std::string &index_path_prefix, uint32_t num_threads,
-                    size_t num_nodes_to_cache, uint32_t cache_mechanism, const std::string &pq_prefix);
+                    size_t num_nodes_to_cache, uint32_t cache_mechanism, const std::string &pq_prefix,
+                    const std::string &partition_prefix);
 
     void cache_bfs_levels(size_t num_nodes_to_cache);
 
@@ -51,6 +56,7 @@ template <typename DT> class StaticDiskIndex
 
   private:
     std::shared_ptr<AlignedFileReader> _reader;
+    std::shared_ptr<AlignedFileReader> _graph_reader;
     diskann::PQFlashIndex<DT> _index;
 };
 } // namespace diskannpy
